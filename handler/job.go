@@ -1,178 +1,148 @@
-package main
+package handler
 
 import (
-	handler "HelloChenHZ/pvcbackup/handler"
-	"flag"
+	"context"
 	"fmt"
+	appv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"log"
-	"os"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
+	"strings"
+	"time"
 )
 
-const backupImageName = "backupimage:v1.0"
-const recoveryImageName = "recoveryimage:v1.0"
-
-func initDB(dbPath string) {
-	// 打开或创建 LevelDB 数据库
-	db, err := leveldb.OpenFile(dbPath, nil)
-	if err != nil {
-		log.Fatalf("无法打开数据库: %v", err)
-	}
-	defer db.Close()
-
-	// 插入值
-	key := []byte("hello")
-	value := []byte("world")
-	err = db.Put(key, value, nil)
-	if err != nil {
-		log.Fatalf("无法插入值: %v", err)
-	}
-
-	fmt.Println("值插入成功:", string(key), string(value))
+type Job struct {
+	JobName           string            `form:"jobName" json:"jobName" binding:"required"`
+	ContainerImage    string            `form:"containerImage" json:"containerImage" binding:"required"`
+	Args              string            `form:"args" json:"args" binding:"required"`
+	NodeAffinityValue string            `form:"nodeAffinityValue" json:"nodeAffinityValue" binding:"required"`
+	CPUtLimit         string            `form:"cpuLimit" json:"cpuLimit"`
+	CPURequest        string            `form:"cpuRequest" json:"cpuRequest"`
+	MemLimit          string            `form:"memLimit" json:"memLimit"`
+	MemRequest        string            `form:"memRequest" json:"memRequest"`
+	Label             map[string]string `form:"label" json:"label"`
 }
 
-func insertDB(dbPath string, key []byte, value []byte) {
-	db, err := leveldb.OpenFile(dbPath, nil)
+func CreateJob(pvcName, nodeName, dataPath, s3Path, containerImage, args string) {
+	t := time.Now().UTC()
+	jobName := pvcName + t.Format("2024-02-25-21")
+	json := Job{
+		JobName:           jobName,
+		ContainerImage:    containerImage,
+		Args:              args,
+		NodeAffinityValue: nodeName,
+		CPUtLimit:         "1000m",
+		MemLimit:          "800Mi",
+		CPURequest:        "100m",
+		MemRequest:        "400Mi",
+	}
+
+	fmt.Printf("Args: %s %s %s\n", json.JobName, json.ContainerImage, json.Args)
+
+	// create job
+	jobs := KubernetesClientset.AppsV1().Deployments("quant-job")
+
+	var replicas int32 = 1
+
+	json.Label["job-name"] = json.JobName
+
+	jobSpec := &appv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      json.JobName,
+			Namespace: "default",
+			Labels:    json.Label,
+		},
+		Spec: appv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: json.Label,
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   json.JobName,
+					Labels: json.Label,
+				},
+				Spec: v1.PodSpec{
+					Affinity: &v1.Affinity{
+						NodeAffinity: &v1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+								NodeSelectorTerms: []v1.NodeSelectorTerm{
+									{
+										MatchExpressions: []v1.NodeSelectorRequirement{
+											{
+												Key:      "type",
+												Operator: v1.NodeSelectorOpIn,
+												Values:   []string{json.NodeAffinityValue},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name:            json.JobName,
+							Image:           json.ContainerImage,
+							Args:            strings.Split(json.Args, " "),
+							ImagePullPolicy: "Always",
+							Resources: v1.ResourceRequirements{
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse(json.CPUtLimit),
+									v1.ResourceMemory: resource.MustParse(json.MemLimit),
+								},
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse(json.CPURequest),
+									v1.ResourceMemory: resource.MustParse(json.MemRequest),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "pvcData",
+									MountPath: "/data",
+								},
+								{
+									Name:      "s3Data",
+									MountPath: "/s3data",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "pvcData",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName, // PVC name
+								},
+							},
+						},
+						{
+							Name: "s3Data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "s3data", // PVC name
+								},
+							},
+						},
+					},
+					RestartPolicy:    v1.RestartPolicyAlways,
+					ImagePullSecrets: []v1.LocalObjectReference{{Name: "gcp-gitlab-registry"}},
+				},
+			},
+		},
+	}
+
+	_, err := jobs.Create(context.TODO(), jobSpec, metav1.CreateOptions{})
 	if err != nil {
-		log.Fatalf("无法打开数据库: %v", err)
-	}
-	defer db.Close()
-
-	// 插入值
-	err = db.Put(key, value, nil)
-	if err != nil {
-		log.Fatalf("无法插入值: %v", err)
+		log.Println("Failed to create K8s job." + err.Error())
+		return
 	}
 
-	fmt.Println("值插入成功:", string(key), string(value))
-}
+	//print job details
+	log.Println("Created K8s job successfully")
 
-func traverseDB(dbPath string) {
-	// 打开 LevelDB 数据库
-	db, err := leveldb.OpenFile(dbPath, nil)
-	if err != nil {
-		log.Fatalf("无法打开数据库: %v", err)
-	}
-	defer db.Close()
-
-	// 创建迭代器
-	iter := db.NewIterator(nil, nil)
-	defer iter.Release()
-
-	// 遍历迭代器
-	for iter.Next() {
-		key := iter.Key()
-		value := iter.Value()
-		fmt.Printf("键：%s，值：%s\n", key, value)
-	}
-	if err := iter.Error(); err != nil {
-		log.Fatalf("迭代器错误: %v", err)
-	}
-}
-
-func snapshotDB(dbPath, backupPath string) {
-	// Open LevelDB database
-	db, err := leveldb.OpenFile(dbPath, &opt.Options{})
-	if err != nil {
-		log.Fatalf("Unable to open database: %v", err)
-	}
-	defer db.Close()
-
-	// Create a snapshot
-	snapshot, err := db.GetSnapshot()
-	if err != nil {
-		log.Fatalf("Unable to create snapshot: %v", err)
-	}
-	defer snapshot.Release()
-
-	// Create a file to write backup
-	backupFile, err := os.Create(backupPath)
-	if err != nil {
-		log.Fatalf("Unable to create backup file: %v", err)
-	}
-	defer backupFile.Close()
-
-	// Iterate over the snapshot and write data to the file
-	iter := snapshot.NewIterator(nil, nil)
-	for iter.Next() {
-		key := iter.Key()
-		value := iter.Value()
-		_, err := fmt.Fprintf(backupFile, "%s:%s\n", key, value)
-		if err != nil {
-			log.Fatalf("Error writing to backup file: %v", err)
-		}
-	}
-	iter.Release()
-
-	if err := iter.Error(); err != nil {
-		log.Fatalf("Iterator error: %v", err)
-	}
-
-	fmt.Println("Backup completed successfully.")
-}
-
-func backupDB(dbPath, backupPath string) {
-	// Open LevelDB database
-	db, err := leveldb.OpenFile(dbPath, &opt.Options{})
-	if err != nil {
-		log.Fatalf("Unable to open database: %v", err)
-	}
-	defer db.Close()
-
-	initDB(backupPath)
-	// Create a snapshot
-	snapshot, err := db.GetSnapshot()
-	if err != nil {
-		log.Fatalf("Unable to create snapshot: %v", err)
-	}
-	defer snapshot.Release()
-
-	// Iterate over the snapshot and write data to the file
-	iter := snapshot.NewIterator(nil, nil)
-	for iter.Next() {
-		key := iter.Key()
-		value := iter.Value()
-		insertDB(backupPath, key, value)
-		//_, err := insertDB(backupPath, key, value)
-		//if err != nil {
-		//	log.Fatalf("Error writing to backup file: %v", err)
-		//}
-	}
-	iter.Release()
-
-	if err := iter.Error(); err != nil {
-		log.Fatalf("Iterator error: %v", err)
-	}
-
-	fmt.Println("Backup completed successfully.")
-}
-
-func main() {
-	//initDB("./test")
-	//insertDB("./test", []byte("HELLO"), []byte("WORLD"))
-	//traverseDB("./test2")
-	//snapshotDB("./test", "./backup")
-	//backupDB("./test", "./test2")
-
-	handler.Init()
-
-	action := flag.String("a", "", "action")
-	pvcName := flag.String("p", "", "PVC Name")
-	dataPath := flag.String("d", "", "Data Path")
-	s3Path := flag.String("d", "", "s3 bucket Path")
-	flag.Parse()
-	fmt.Println(*action, *pvcName, *s3Path)
-	// get node path by pvc name
-	nodeName := handler.GetNodeName(*pvcName)
-
-	if *action == "backup" {
-		// create job
-		handler.CreateJob(*pvcName, nodeName, *dataPath, *s3Path, backupImageName)
-	}
-
-	if *action == "recovery" {
-		handler.CreateJob(*pvcName, nodeName, *dataPath, *s3Path, recoveryImageName)
-	}
+	return
 }
