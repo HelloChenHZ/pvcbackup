@@ -3,14 +3,15 @@ package handler
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
+	"time"
+
 	appv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"log"
-	"strings"
-	"time"
 )
 
 type Job struct {
@@ -25,7 +26,7 @@ type Job struct {
 	Label             map[string]string `form:"label" json:"label"`
 }
 
-func CreateJob(pvcName, nodeName, dataPath, s3Path, containerImage, args string) {
+func createJob(pvcName, nodeName, dataPath, s3Path, containerImage, args string) {
 	t := time.Now().UTC()
 	jobName := pvcName + t.Format("2024-02-25-21")
 	json := Job{
@@ -42,7 +43,7 @@ func CreateJob(pvcName, nodeName, dataPath, s3Path, containerImage, args string)
 	fmt.Printf("Args: %s %s %s\n", json.JobName, json.ContainerImage, json.Args)
 
 	// create job
-	jobs := KubernetesClientset.AppsV1().Deployments("quant-job")
+	jobs := KubernetesClientset.AppsV1().Deployments("default")
 
 	var replicas int32 = 1
 
