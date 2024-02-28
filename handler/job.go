@@ -73,7 +73,7 @@ func createJob(pvcName, nodeName, dataPath, s3Path, containerImage, args string)
 									{
 										MatchExpressions: []v1.NodeSelectorRequirement{
 											{
-												Key:      "type",
+												Key:      "kubernetes.io/hostname",
 												Operator: v1.NodeSelectorOpIn,
 												Values:   []string{json.NodeAffinityValue},
 											},
